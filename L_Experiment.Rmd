@@ -1,0 +1,824 @@
+---
+title: "proDA analysis of Virology data (proteins interaction - BioID data)"
+author: "Philippe Hauchamps"
+date: "December 5th, 2019"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+## Goal of this report
+
+The goal of this report is to analyze protein intensity data from a Virology
+BioID protein interaction experiment. 
+
+Input data are taken from a set of files processed by MaxQuant platform. 
+We concentrate on the so-called 'L' experiment and consider the 3 different 
+conditions :
+
+- Wild Type (WT)
+- Mutated M60V
+- Mutated F48A
+
+There might be a batch effect, since among the 3 replicates per condition, one
+was produced first, and the two others in a subsequent batch.
+
+M60V serves as negative control and should be compared against the two other
+conditions, where we would like to identify the differentially abundant
+proteins. 
+
+Questions of interest :
+
+- which proteins are significantly differentially abundant in WT vs. M60V ?
+- among these, do we see an enrichment for the proteins belonging to FG-NUP 
+group? (see below for a definition of this group)
+- same two questions for F48A vs. M60V
+
+In order to cope with high proportion of missing data (not at random), we use
+the proDA package which :
+
+- belongs to the class of empirical bayes methods
+- models the missingness process explicitly, and link it to the latent protein
+intensities.
+
+```{r load_libraries, echo = FALSE, message = FALSE}
+library("MSnbase", quietly = TRUE)
+library("pRoloc", quietly = TRUE)
+library("proDA", quietly = TRUE)
+library("knitr", quietly = TRUE)
+library("magrittr", quietly = TRUE)
+```
+
+
+## Read MaxQuant data - build MSnSet object
+
+While importing the MaxQuant data into an MSnSet object, we filter out :
+
+- identified contaminants
+- identified reverse sequences
+- proteins which do not have any positive intensity for any sample.
+
+After filtering, we obtain intensities for 997 proteins.
+
+Indeed we have 9 samples, i.e. 3 conditions and 3 replicates per condition. 
+
+
+```{r read_MaxQuant}
+f <- "data/MQ20191112/txt/proteinGroups.txt"
+#getEcols(f, "\t")
+
+## e <- grepEcols(f, "LFQ ", "\t")
+e <- grepEcols(f, "Intensity ", "\t")
+# Make MSnSet object
+x <- readMSnSet2(f, ecol = e, sep = "\t")
+sampleNames(x) <- sub("Intensity.", "", sampleNames(x))
+pData(x)$rep <- rep(1:3, 3)
+pData(x)$grp <- rep(c("F48A", "M60V", "WT"), each = 3)
+pData(x)$grp <- factor(pData(x)$grp, levels = c("M60V", "WT", "F48A"))
+pData(x)$batch <- rep(c(1, 2, 2), 3)
+
+featureNames(x) <- fData(x)$Protein.IDs
+
+## Remove contaminants, reverse and no expression
+## changed: was ^CON and ^REV
+x <- x[-grep("CON", fData(x)[, "Protein.IDs"])]
+x <- x[-grep("REV", fData(x)[, "Protein.IDs"])]
+x <- x[rowSums(exprs(x)) > 0, ]
+nSamples <- nrow(pData(x))
+nProteins <- nrow(x)
+cat("nSamples : ", nSamples, "\n")
+cat("nProteins : ", nProteins, "\n")
+```
+
+
+
+## Some exploratory data analysis
+
+### PCA via pRoloc::plot2D
+
+We compute a preliminary PCA, and display the scores of the samples on 2D 
+projections.
+
+Projection on 1 and 2 principal components show that WT samples present much 
+more variability than the samples of M60V and F48A.
+It seems very difficult to show a clear separation of M60V samples vs. F48A
+samples. Projection to component 5 and 6 is the better projection we could get
+for this matter.
+
+```{r PCA}
+par( mfrow = c(1,2) )
+#plot2D(normalise(x, "sum"), fcol = NULL)
+
+.pca <- plot2D(t(x),  fcol = "grp", cex = 3, dims = 1:2)
+text(.pca[, 1], .pca[, 2], 1:3)
+addLegend(t(x), fcol = "grp")
+.pca <- plot2D(t(x),  fcol = "grp", cex = 3, dims = 5:6)
+text(.pca[, 1], .pca[, 2], 1:3)
+addLegend(t(x), fcol = "grp")
+```
+
+### boxplot and density of log( intensities )
+
+We can notice the effect of group and a slight batch effect (1 vs 2-3) as well,
+especially with the WT group.
+
+```{r exploratory}
+par( mfrow = c(1,1) )
+boxplot(exprs(x)+1, log = "y")
+```
+
+```{r exploratory2}
+limma::plotDensities(log2(exprs(x) + 1), 
+                     legend = "topright")
+```
+
+### NA's per sample
+
+We have 44% of missing data. As expected, we have less missing data for the WT,
+since expected protein intensities for this group are higher.
+
+```{r NAs}
+# Replace 0 by NA
+exprs(x)[exprs(x) == 0] <- NA
+pData(x)$nNA <- colSums(is.na(exprs(x)))
+fData(x)$nNA <- rowSums(is.na(exprs(x)))
+
+cat("NA's : ", round( 100 * mean( is.na(x) ), 2 ), "%\n" )
+
+barplot(pData(x)$nNA,
+        ylab = "# missing values",
+        xlab = "Samples",
+        main = "# missing values per sample",
+        col = rep(c(2, 3, 4), each = 3))
+legend("topright",
+       legend=unique( pData( x )$grp ),
+       cex = 0.7,
+       fill = c(2, 3, 4))
+```
+
+## proDA analysis after normalization
+
+We normalize the log2 transformed sample data using translation
+wrt column (sample) median. We also add a constant, in order to avoid displaying
+negative values.
+
+```{r proDA_normlog}
+norm_log_x <- x %>%
+    log(base = 2) %>%
+    normalise(method = "center.median" )
+exprs(norm_log_x) <- exprs(norm_log_x) + 5 ## to remove negative values
+```
+
+We then run proDA analysis on log2 transformed data.  
+We run one model fit with only 'group' (M60V vs. WT vs. F48A) as covariate 
+and another model with both 'group' and 'batch' as covariates.
+
+```{r proDA_normlog_modelfit}
+file_name <- "rds/proDA_fit_norm_3grp.rds"
+if ( file.exists( file_name )) {
+    proDA_fit_norm <- readRDS( file_name )
+} else {
+
+    proDA_fit_norm <- proDA( norm_log_x,
+                            design = ~ grp,
+                            data_is_log_transformed = TRUE,
+                            verbose = TRUE)
+
+    saveRDS( proDA_fit_norm, file = file_name )
+}
+
+file_name <- "rds/proDA_fit_full_norm_3grp.rds"
+if ( file.exists( file_name )) {
+    proDA_fit_full_norm <- readRDS( file_name )
+} else {
+    proDA_fit_full_norm <- proDA( norm_log_x,
+                                 design = ~ grp + batch,
+                                 data_is_log_transformed = TRUE,
+                                 verbose = TRUE)
+
+    saveRDS( proDA_fit_full_norm, file = file_name )
+}
+```
+
+### Test of the batch effect
+
+From the full model, we test whether the batch effect is significant. 
+First ajusted p-vals are around 0.21. We can therefore remove the batch
+covariate from the model.
+
+```{r tests_norm_full}
+batch_res <- test_diff( proDA_fit_full_norm,
+                        contrast = "batch",
+                        alternative = "two.sided",
+                        pval_adjust_method = "BH",
+                        sort_by = "pval" )
+
+head(dplyr::arrange(batch_res, adj_pval))
+```
+
+### LR test of the group effect in the reduced model
+
+We start by testing the 'group' effect as a whole 
+(i.e. for all levels simultaneously), using a likelihood ratio test.
+
+We get smallest p-vals around 10e-6 and adjusted p-val between 0.08% and 1.7%
+
+=> it is definitely worthwhile looking at differences for pairs of levels.
+
+```{r tests_norm_partial_LRT}
+grp_res <- test_diff( proDA_fit_norm,
+                       reduced_model = ~1,
+                       pval_adjust_method = "BH",
+                       sort_by = NULL,
+                       verbose = F )
+
+dplyr::arrange(grp_res, adj_pval) %>%
+    head()
+```
+
+```{r display_test_results_fctions}
+displaySignificantProteins <- function(tstResults,
+                                       alpha,
+                                       nameMaxLength = 30){
+  
+  nSignifPct <- sum( tstResults$adj_pval <= alpha )
+  cat("Significant at ", alpha * 100 ,"% : ", nSignifPct, 
+      "out of ", nrow(tstResults), "\n" )
+  
+  displayed <- tstResults[order(tstResults$pval),][1:nSignifPct, c("name", 
+                                                                   "diff", 
+                                                                   "pval", 
+                                                                   "adj_pval", 
+                                                                   "n_obs")]
+  displayed$name <- sapply(as.character(displayed$name),
+                           FUN = function(x) {
+                                  ifelse(nchar(x) > nameMaxLength,
+                                         paste0(substr(x, 1, nameMaxLength - 5),
+                                                "(...)"),
+                                         x)}
+                          )
+  knitr::kable(displayed)
+}
+
+plotVolcano <- function(tstResults,
+                        alpha,
+                        # set to highlight on the graph
+                        # if null => statistically signif. will be highlighted
+                        set2Highlight = NULL, 
+                        highlightColor = "red",
+                        displayHighlightedNames = FALSE
+                        ) {
+  if( !is.null(set2Highlight)){
+    highLighted <- tstResults$set == set2Highlight
+  }
+  else
+  {
+    highLighted <- tstResults$adj_pval <= alpha
+  }
+  
+  plot( x = tstResults$diff,
+      y = -log10(tstResults$adj_pval),
+      col = ifelse( highLighted, highlightColor, "grey"),
+      xlab = "lfc",
+      ylab = "-log10(pvalue)",
+      main = paste( "Diff. protein abundance (alpha =",alpha,")" )
+    )
+  
+  abline( h = -log10(alpha), col = "red", lty = 2 )
+  
+  if(displayHighlightedNames){
+    names <- as.character(tstResults$name)
+    text(tstResults$diff,
+      -log10(tstResults$adj_pval),
+      ifelse(highLighted, names, ""),
+      cex = 0.6,
+      pos = 4,
+      col = highlightColor,
+      offset = 0.5)
+  }
+}
+
+```
+
+### Wald test of WT vs M60V
+
+Here we test (in the reduced model) whether the group difference WT vs M60V 
+is significant. We opt for a one-sided as we know that WT group should have 
+greater intensities, M60V being the negative control. We get :
+
+- smallest p-vals around 10e-5 and adjusted p-val between 0.3% and 1.5%
+
+- some protein abundances significantly differ at 5% level.
+
+
+```{r tests_norm_partial}
+grp_res <- test_diff( proDA_fit_norm,
+                       contrast = "grpWT",
+                       alternative = "greater",
+                       pval_adjust_method = "BH",
+                       sort_by = NULL,
+                       verbose = F )
+
+dplyr::arrange(grp_res, adj_pval) %>%
+    head()
+```
+
+We now provide a list of proteins that are significantly differentially 
+abundant (WT vs M60V), at 5% level (ordered by p-value). 
+We have 114 of such differentially abundant proteins.
+
+We also display a corresponding volcano plot (highlighted for alpha = 5%).
+
+```{r differ_abundances}
+proteins_res <- grp_res
+proteins_res$name <- fData( norm_log_x )$Gene.names
+
+alpha <- 0.05
+
+displaySignificantProteins(proteins_res,
+                           alpha)
+
+plotVolcano(proteins_res,
+            alpha
+            )
+
+```
+
+Let's now zoom on the FG-NUP proteins. The list is shown below :
+
+```{r FGNUP_group_definition}
+FGNupGroup <- c("RANBP2", 
+                "NUP214", 
+                "NUPL2", 
+                "NUP62", 
+                "NUP54", 
+                "NUPL1", 
+                "NUP98", 
+                "POM121", 
+                "POM121C", 
+                "NUP153", 
+                "NUP50")
+kable(FGNupGroup)
+
+```
+
+
+From the volcano plot, we can see that these FG-NUP proteins are well represented 
+in the domain of positive and significant log fold changes.
+
+```{r FGNUP_proteins}
+
+proteins_res$set <- as.factor(ifelse(proteins_res$name %in% FGNupGroup,
+                                     "FG-NUP",
+                                     "Not_FG-NUP"))
+
+FGNUP_proteins_res <- proteins_res[ proteins_res$set == "FG-NUP",]
+knitr::kable(FGNUP_proteins_res[order(FGNUP_proteins_res$pval),
+                              c("name", "diff", "pval", "adj_pval", "n_obs")] )
+
+plotVolcano( proteins_res,
+             alpha = alpha,
+             set2Highlight = "FG-NUP",
+             highlightColor = "blue",
+             displayHighlightedNames = TRUE
+             )
+```
+
+The below shows the histogram of p-values. It shows a clear enrichment in the
+low end.
+
+```{r pValue.histogram}
+hist(proteins_res$pval, breaks = 100)
+```
+
+### Wald test of F48A vs M60V
+
+Here we test (in the reduced model) whether the group difference F48A vs M60V 
+is significant. Again, we opt for a one-sided as we know that F48A group should 
+have greater intensities, M60V being the negative control. We get :
+
+- smallest p-vals around 10e-5 and adjusted p-val between 0.1% and 2.5%
+
+- some protein abundances significantly differ at 5% level.
+
+```{r tests_norm_partial2}
+grp_res2 <- test_diff( proDA_fit_norm,
+                       contrast = "grpF48A",
+                       alternative = "greater",
+                       pval_adjust_method = "BH",
+                       sort_by = NULL,
+                       verbose = F )
+
+dplyr::arrange(grp_res2, adj_pval) %>%
+    head()
+```
+
+We now provide a list of proteins that are significantly differentially 
+abundant (F48A vs M60V), at 5% level (ordered by p-value). 
+Here we only have 6 of such differentially abundant proteins!
+
+We also display the corresponding volcano plot (highlighted for alpha = 5%).
+
+```{r differ_abundances2}
+proteins_res2 <- grp_res2
+proteins_res2$name <- fData( norm_log_x )$Gene.names
+
+alpha <- 0.05
+
+displaySignificantProteins(proteins_res2,
+                           alpha)
+
+plotVolcano(proteins_res2,
+            alpha,
+            displayHighlightedNames = FALSE
+            )
+```
+
+Let's now zoom again on FG-NUP proteins. From the volcano plot, we can see that, 
+among the 6 significantly differentially abundant proteins, 5 belong to the
+this group.
+
+```{r FGNUP_proteins2}
+proteins_res2$set <- as.factor(ifelse(proteins_res$name %in% FGNupGroup,
+                                     "FG-NUP",
+                                     "Not_FG-NUP"))
+FGNUP_proteins_res2 <- proteins_res2[ proteins_res$set == "FG-NUP",]
+knitr::kable(FGNUP_proteins_res2[order(FGNUP_proteins_res$pval),
+                              c("name", "diff", "pval", "adj_pval", "n_obs")] )
+
+plotVolcano( proteins_res2,
+             alpha = alpha,
+             set2Highlight = "FG-NUP",
+             highlightColor = "blue",
+             displayHighlightedNames = TRUE
+             )
+
+```
+
+## Over Representation Analysis of the FG-NUP protein group (WT vs M60V)
+
+### Using Fisher's exact test (hyper-geometric distribution)
+
+Let's perform an over representation analysis of the FG-NUP proteins with
+respect to the other proteins. This is implemented as a Fisher's exact
+test using the hyper-geometric distribution, also known as the '2X2
+method'.
+
+Here below is the corresponding contingency table. 'DA' stands for
+'Differentially abundant'. We classify the proteins into DA or not DA
+based on the adjusted p-value of the proDA analysis, and we select a
+treshhold of 0.05.
+
+```{r FGNUP_fisher_test_table}
+DA_signif_threshold <- 0.05
+fisher_input_data <- proteins_res[,c("name", "pval", "adj_pval", "set")]
+fisher_input_data$DA <- as.factor( ifelse( fisher_input_data$adj_pval 
+                                           < DA_signif_threshold,
+                                   "DA",
+                                   "Not_DA") )
+
+contingency_table <- table( fisher_input_data[,c("DA", "set")] )
+knitr::kable(contingency_table)
+```
+
+The Fisher exact test gives the below results. We reject the null
+hypothese (p-value = 4.8e-05) of independence of the two following
+events:
+
+- a given protein being member of 'FG-NUP' group
+- the same protein being differentially abundantin Wild vs M60V conditions.
+
+Note that  (we use a rather arbitrary threshold of 5% to classify between 
+differentially abundant and not differentially abundant proteins) 
+
+```{r FGNUP_fisher_test}
+fisher_test <- fisher.test(x = contingency_table,
+                           or = 1,
+                           alternative = "two.sided",
+                           conf.int = TRUE,
+                           conf.level = 0.95)
+
+fisher_test
+```
+
+### Using GSEA
+
+There are several issues linked to Fisher's test applied to post-hoc
+ORA (Over Representation Analysis) (see e.g. reference [1]), most important
+ones being :
+
+- It uses an arbitrary significant threshold to classify between diffe -
+  rentially abundant and not differentially abundant proteins (here 5%
+  of adjusted p-value), and the result of the Fisher's test is highly 
+  dependent on the threshold chosen.
+
+- ORA implicitely assumes that each protein is independent from the other
+  proteins (sample unit underlying the Fisher's test is the proteins, not
+  the initial experiment sample unit, and underlying assumption is that
+  samples are i.i.d.)
+
+In an attempt to address these issues, we implement a procedure
+similar to what is implemented in GSEA (for 'Gene Set Enrichment Analysis')
+software (see reference [2]).
+
+<!-- TODO : explain the procedure (non parametric statistic + random sample -->
+<!-- permutation) -->
+
+We first calculate the Enrichment Score as well as showing the
+Enrichment Score path.  The score is equal to 700. The Enrichment
+Score path shows a steep increase for the first proteins. Note that
+each proteins belonging to FG-NUP group adds 89 units to the score, while
+each proteins not belonging to FG-NUP group substract only one unit to
+the score.
+
+```{r get_enrichment_score}
+# the following function calculates an enrichment score (as in
+# ref. [2] based a list of proteins with their pro-DA p-value (sorted
+# according to decreasing p-value), and their set tags.
+get_enrichment_score <- function(proteins_res, set) {
+  ## order results set
+    proteins_res <- proteins_res[ order( proteins_res$pval, decreasing = FALSE ), ]
+    n_proteins <- nrow( proteins_res )
+    n_proteins_in_set <- sum( proteins_res$set == set )
+    set_ratio <- (n_proteins - n_proteins_in_set) / n_proteins_in_set
+    set_indicators <- 1 * (proteins_res$set == set)
+    prot.contributions <- -1 * rep(1, n_proteins) + (1 + set_ratio) * set_indicators
+    path <- cumsum( prot.contributions )
+    ES <- max( path )
+    return( list( ES_path = path, ES = ES ) )
+}
+```
+
+
+```{r enrichment_score_FG-NUP_WT}
+ret <- get_enrichment_score( proteins_res, set = "FG-NUP" )
+the_ES <- ret$ES
+the_ES
+#ret$ES_path
+
+par( mfrow = c(1,1) )
+plot( x = seq( 1, length( ret$ES_path ) ),
+      y = ret$ES_path,
+      type = "l",
+      col = "blue",
+      main = "Enrichment score path" )
+```
+
+```{r GSEA_Permutation_function}
+# the following function :
+# - creates a random permutation of two sample groups (or identity permutation if 'do_permutation' == FALSE)
+# - fits the proDA analysis based on the newly assigned abundances (including NA's)
+# - calculates the p-val of the differential analysis for each gene
+# - orders the gene by decreasing order of p-val (not adjusted)
+# - calculates the Enrichment score as described in Ref. [2]
+
+# input : 'experiment' : a MSnSet object containing the experiment data
+#         'set' : the set variable (as a factor) for which to compute an enrichment score
+#         'seed' : starting seed to generate the Monte Carlo simulation from
+#         'contrast' : the contrast character to be used in the statistical test
+one_permutation_enrichment_score <- function(experiment,
+                                             set,
+                                             seed,
+                                             contrast,
+                                             filePrefix,
+                                             do_permutation = TRUE){
+  set.seed(seed)
+  
+  groups <- pData(experiment)$grp
+  nSamples <- length(groups)
+  groupNames <- unique(groups)
+  nGroups <- length(groupNames)
+
+  groupSamples <- list()
+  nInGroup <- rep(0L, nGroups)
+  
+  for(i in 1:nGroups){
+    groupSamples[[i]] <- which(groups == groupNames[i])
+    nInGroup[i] <- length(groupSamples[[i]])
+  }
+
+  # generate one permutation between all the groups 
+  permGroupSamples <- list()
+  # keep the number of samples per group same as originally
+  if ( do_permutation ) {
+    samplesOrder <- sample(1:nSamples, nSamples, replace = FALSE)
+    currentIndex <- 0
+    for(i in 1:nGroups){
+      permGroupSamples[[i]] <- samplesOrder[currentIndex 
+                                          + (1:nInGroup[i])]
+      currentIndex <- currentIndex + nInGroup[i]
+      permGroupSamples[[i]] <- sort(permGroupSamples[[i]])
+    }
+
+  } else {
+    permGroupSamples <- groupSamples
+  }
+
+  permuted_experiment <- experiment
+  for(i in 1:nGroups){
+    pData(permuted_experiment)$grp[permGroupSamples[[i]]] <- groupNames[i]
+  }
+  #pData(permuted_experiment)
+
+  # calling the proDA machinery
+
+  suffix <- paste(permGroupSamples[[1]], collapse = "_")
+  for(i in 2:nGroups){
+    suffix <- paste0(suffix, "__")
+    suffix <- paste0(suffix, paste(permGroupSamples[[i]], collapse = "_"))
+  }
+  file_name <- paste0( filePrefix, suffix, ".rds" )
+  #file_name <- paste0( "./rds/GSEA/3groups/proDA_fit_norm_perm_", suffix, ".rds" )
+
+  if (file.exists(file_name)){
+    proDA_fit_norm_perm <- readRDS(file_name)
+  } else {
+    cat(" Running proDA model fitting with permutation", suffix, "\n")
+    cat(" ***************************************************")
+    proDA_fit_norm_perm <- proDA(permuted_experiment,
+                                 design = ~ grp,
+                                 data_is_log_transformed = TRUE,
+                                 verbose = TRUE)
+
+    saveRDS(proDA_fit_norm_perm, file = file_name)
+  }
+
+  # getting the proDA results
+  perm_res <- test_diff( proDA_fit_norm_perm,
+                       contrast = contrast,
+                       alternative = "greater",
+                       pval_adjust_method = "BH",
+                       sort_by = NULL,
+                       verbose = FALSE)
+  perm_res$name <- fData(experiment)$Gene.names
+  perm_res$set <- set
+  ret <- get_enrichment_score(perm_res, set = levels(set)[1])
+  ret
+}
+```
+
+```{R GSEA_Permutation_test_WT}
+file_name <- "./rds/GSEA/3groups/permutation_test_enrichscores_WT_vs_M60V.rds"
+filePrefix <- "./rds/GSEA/3groups/proDA_fit_norm_perm_"
+mySeed <- 20190512
+
+if ( file.exists( file_name )) {
+  ER_sample <- readRDS( file_name )
+} else {
+  n_permutations <- 100 
+  ER_sample <- rep(0, n_permutations)
+  for (i in 1:n_permutations) {
+      seed <- mySeed + i
+      ret <- one_permutation_enrichment_score(norm_log_x,
+                                              set = proteins_res$set,
+                                              seed = seed,
+                                              contrast = "grpWT",
+                                              filePrefix = filePrefix,
+                                              do_permutation = TRUE)
+      ER_sample[i] <- ret$ES
+  }
+
+  saveRDS( ER_sample, file_name )
+}
+
+#hist( ER_sample, main = "Enrichment Score p-value")
+
+#max( ER_sample )
+ERS <- sort( unique( ER_sample ) )
+## hist( ERS, main = "Enrichment Scores - permutation values")
+plot( density(ERS), main = "Enrichment Scores - permutation values")
+rug(ERS)
+abline( v = the_ES, col = "blue" )
+```
+
+## Over Representation Analysis of the FG-NUP protein group (F48A vs M60V)
+
+### Using Fisher's exact test (hyper-geometric distribution)
+
+Here below is the corresponding contingency table. Again, we classify the 
+proteins into DA or not DA based on the adjusted p-value of the proDA analysis, 
+and we select a treshold of 0.05.
+
+```{r FGNUP_fisher_test_table_F48A}
+DA_signif_threshold <- 0.05
+fisher_input_data2 <- proteins_res2[,c("name", "pval", "adj_pval", "set")]
+fisher_input_data2$DA <- as.factor( ifelse( fisher_input_data2$adj_pval 
+                                            < DA_signif_threshold,
+                                   "DA",
+                                   "Not_DA") )
+
+contingency_table2 <- table( fisher_input_data2[,c("DA", "set")] )
+knitr::kable(contingency_table2)
+```
+
+The Fisher exact test gives the below results. We reject the null
+hypothese (p-value = 3.4e-10) of independence of the two following
+events:
+
+- a given protein being member of 'FG-NUP' group
+- the same protein being differentially abundant in F48A vs M60V conditions.
+
+```{r NUP_fisher_test_F48A}
+fisher_test2 <- fisher.test(x = contingency_table2,
+                           or = 1,
+                           alternative = "two.sided",
+                           conf.int = TRUE,
+                           conf.level = 0.95)
+
+fisher_test2
+```
+
+### Using GSEA
+
+```{r enrichment_score_FG-NUP_F48A}
+ret2 <- get_enrichment_score( proteins_res2, set = "FG-NUP" )
+the_ES2 <- ret2$ES
+the_ES2
+#ret$ES_path
+
+par( mfrow = c(1,1) )
+plot( x = seq( 1, length( ret2$ES_path ) ),
+      y = ret2$ES_path,
+      type = "l",
+      col = "blue",
+      main = "Enrichment score path" )
+```
+```{R GSEA_Permutation_test_F48A}
+file_name <- "./rds/GSEA/3groups/permutation_test_enrichscores_F48A_vs_M60V.rds"
+filePrefix <- "./rds/GSEA/3groups/proDA_fit_norm_perm_"
+mySeed <- 20190512
+
+if ( file.exists( file_name )) {
+  ER_sample <- readRDS( file_name )
+} else {
+  n_permutations <- 100 
+  ER_sample <- rep(0, n_permutations)
+  for (i in 1:n_permutations) {
+      seed <- mySeed + i
+      ret <- one_permutation_enrichment_score(norm_log_x,
+                                              set = proteins_res$set,
+                                              seed = seed,
+                                              contrast = "grpF48A",
+                                              filePrefix = filePrefix,
+                                              do_permutation = TRUE)
+      ER_sample[i] <- ret$ES
+  }
+
+  saveRDS( ER_sample, file_name )
+}
+
+#hist( ER_sample, main = "Enrichment Score p-value")
+
+#max( ER_sample )
+ERS <- sort( unique( ER_sample ) )
+## hist( ERS, main = "Enrichment Scores - permutation values")
+plot( density(ERS), main = "Enrichment Scores - permutation values")
+rug(ERS)
+abline( v = the_ES2, col = "blue" )
+```
+
+
+## Export final results
+
+Full export: normalised data and proDA results (for shiny app)
+
+```{r full_export}
+fd <- fData(norm_log_x)[, c("Protein.IDs",
+                            "Protein.names",
+                            "Gene.names",
+                            "nNA")]
+norm_log_x1 <- norm_log_x
+fd1 <- dplyr::full_join(fd, proteins_res, by = c("Gene.names" = "name"))
+rownames(fd1) <- fd1[[1]]
+fData(norm_log_x1) <- fd1
+res1 <- ms2df(norm_log_x1)
+res1$set[res1$set == "Not_FG-NUP"] <- NA
+saveRDS(res1, file = "rds/res_expL_WT_vs_M60V.rds")
+
+norm_log_x2 <- norm_log_x
+fd2 <- dplyr::full_join(fd, proteins_res2, by = c("Gene.names" = "name"))
+rownames(fd2) <- fd2[[1]]
+fData(norm_log_x2) <- fd2
+res2 <- ms2df(norm_log_x2)
+res2$set[res2$set == "Not_FG-NUP"] <- NA
+saveRDS(res2, file = "rds/res_expL_F48A_vs_M60V.rds")
+```
+
+## Session information
+
+```{r si}
+sessionInfo()
+```
+
+## References
+
+[1] Goeman, Jelle J., and Peter Bühlmann. 2007. "Analyzing Gene Expression Data 
+in Terms of Gene Sets: Methodological Issues." Bioinformatics  23 (8): 980-87.
+
+[2] Subramanian, Aravind, Pablo Tamayo, Vamsi K. Mootha, Sayan Mukherjee, 
+Benjamin L. Ebert, Michael A. Gillette, Amanda Paulovich, et al. 2005. 
+"Gene Set Enrichment Analysis: A Knowledge-Based Approach for Interpreting 
+Genome-Wide Expression Profiles." Proceedings of the National Academy of 
+Sciences of the United States of America 102 (43): 15545-50.

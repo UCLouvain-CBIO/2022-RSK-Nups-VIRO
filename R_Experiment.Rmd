@@ -1,0 +1,563 @@
+---
+title: "proDA analysis of Virology data (proteins interaction - BioID data)"
+author: "Philippe Hauchamps"
+date: "December 18th, 2019"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+## Goal of this report
+
+The goal of this report is to analyze protein intensity data from a Virology
+BioID protein interaction experiment. 
+
+Input data are taken from a set of files processed by MaxQuant platform. 
+Here we concentrate on the so-called 'R' experiment and consider 2 different 
+conditions :
+
+- Wild Type (WT)
+- Mutated M60V
+
+There might be a batch effect, since among the 3 replicates per condition, one
+was produced first, and the two others in a subsequent batch.
+
+M60V serves as negative control and should be compared against the WT
+condition, where we would like to identify the differentially abundant
+proteins. 
+
+Questions of interest :
+
+- which proteins are significantly differentially abundant in WT vs. M60V ?
+- among these, do we see an enrichment for the proteins belonging to FG-NUP 
+group? (see below for a definition of this group)
+
+In order to cope with high proportion of missing data (not at random), we use
+the proDA package which :
+
+- belongs to the class of empirical bayes methods
+- models the missingness process explicitly, and link it to the latent protein
+intensities.
+
+```{r load_libraries, echo = FALSE, message = FALSE}
+library("MSnbase", quietly = TRUE)
+library("pRoloc", quietly = TRUE)
+library("proDA", quietly = TRUE)
+library("knitr", quietly = TRUE)
+library("magrittr", quietly = TRUE)
+```
+
+
+## Read MaxQuant data - build MSnSet object
+
+While importing the MaxQuant data into an MSnSet object, we filter out :
+
+- identified contaminants
+- identified reverse sequences
+- proteins which do not have any positive intensity for any sample.
+
+After filtering, we obtain intensities for 1397 proteins.
+
+We check that we have 6 samples, i.e. 2 conditions and 3 replicates per condition. 
+
+
+```{r read_MaxQuant}
+f <- "data/MQ20191213/combined/proteinGroups.txt"
+#getEcols(f, "\t")
+
+## e <- grepEcols(f, "LFQ ", "\t")
+e <- grepEcols(f, "Intensity ", "\t")
+# Make MSnSet object
+x <- readMSnSet2(f, ecol = e, sep = "\t")
+sampleNames(x) <- sub("Intensity.", "", sampleNames(x))
+pData(x)$rep <- rep(1:3, 2)
+pData(x)$grp <- rep(c("M60V", "WT"), each = 3)
+pData(x)$grp <- factor(pData(x)$grp, levels = c("M60V", "WT"))
+pData(x)$batch <- rep(c(1, 2, 2), 2)
+
+featureNames(x) <- fData(x)$Protein.IDs
+
+## Remove contaminants, reverse and no expression
+## changed: was ^CON and ^REV
+x <- x[-grep("CON", fData(x)[, "Protein.IDs"])]
+x <- x[-grep("REV", fData(x)[, "Protein.IDs"])]
+x <- x[rowSums(exprs(x)) > 0, ]
+nSamples <- nrow(pData(x))
+nProteins <- nrow(x)
+cat("nSamples : ", nSamples, "\n")
+cat("nProteins : ", nProteins, "\n")
+```
+
+
+
+## Some exploratory data analysis
+
+### PCA via pRoloc::plot2D
+
+We compute a preliminary PCA, and display the scores of the samples on 2D 
+projections.
+
+These projections are difficult to interpret. A batch effect (replicate 1 vs.
+2 and 3) seems to be present for condition M60V but is less evident for WT.
+
+It seems also difficult to show a clear separation of M60V samples vs. WT when
+looking at the components 2D projections. 
+
+```{r PCA}
+par( mfrow = c(1,3) )
+#plot2D(normalise(x, "sum"), fcol = NULL)
+
+.pca <- plot2D(t(x),  fcol = "grp", cex = 3, dims = 1:2)
+text(.pca[, 1], .pca[, 2], 1:3)
+addLegend(t(x), fcol = "grp")
+.pca <- plot2D(t(x),  fcol = "grp", cex = 3, dims = 3:4)
+text(.pca[, 1], .pca[, 2], 1:3)
+addLegend(t(x), fcol = "grp")
+.pca <- plot2D(t(x),  fcol = "grp", cex = 3, dims = 5:6)
+text(.pca[, 1], .pca[, 2], 1:3)
+addLegend(t(x), fcol = "grp")
+
+```
+
+### boxplot and density of log( intensities )
+
+Strangely, it seems that WT1 showed much more NA's than the other samples, which
+is not what we would expect. WT2 also shows a strange pattern in terms of 
+densities.
+
+```{r exploratory}
+par( mfrow = c(1,1) )
+boxplot(exprs(x)+1, log = "y")
+```
+
+```{r exploratory2}
+limma::plotDensities(log2(exprs(x) + 1), 
+                     legend = "topright")
+```
+
+### NA's per sample
+
+We have 37% of missing data. As expected, we have less missing data for the WT,
+but only for replicate 2 and 3. As mentioned already, replicate 1 for WT 
+condition does not show the expected pattern when compared to replicate 1 for
+M60V (which is supposed to be the negative control).
+
+```{r NAs}
+# Replace 0 by NA
+exprs(x)[exprs(x) == 0] <- NA
+pData(x)$nNA <- colSums(is.na(exprs(x)))
+fData(x)$nNA <- rowSums(is.na(exprs(x)))
+
+cat("NA's : ", round( 100 * mean( is.na(x) ), 2 ), "%\n" )
+
+barplot(pData(x)$nNA,
+        ylab = "# missing values",
+        xlab = "Samples",
+        main = "# missing values per sample",
+        col = rep(c(2, 3, 4), each = 3))
+legend("topright",
+       legend=unique( pData( x )$grp ),
+       cex = 0.7,
+       fill = c(2, 3, 4))
+```
+
+## proDA analysis after normalization
+
+We normalize the log2 transformed sample data using translation
+wrt column (sample) median. We also add a constant, in order to avoid displaying
+negative values.
+
+```{r proDA_normlog}
+norm_log_x <- x %>%
+    log(base = 2) %>%
+    normalise(method = "center.median" )
+exprs(norm_log_x) <- exprs(norm_log_x) + 5 ## to remove negative values
+```
+
+We then run proDA analysis on log2 transformed data.  
+We run one model fit with only 'group' (M60V vs. WT) as covariate 
+and another model with both 'group' and 'batch' as covariates.
+
+```{r proDA_normlog_modelfit}
+file_name <- "rds/proDA_fit_norm_3grp_Rexp.rds"
+if ( file.exists( file_name )) {
+    proDA_fit_norm <- readRDS( file_name )
+} else {
+
+    proDA_fit_norm <- proDA( norm_log_x,
+                            design = ~ grp,
+                            data_is_log_transformed = TRUE,
+                            verbose = TRUE)
+
+    saveRDS( proDA_fit_norm, file = file_name )
+}
+
+file_name <- "rds/proDA_fit_full_norm_3grp_Rexp.rds"
+if ( file.exists( file_name )) {
+    proDA_fit_full_norm <- readRDS( file_name )
+} else {
+    proDA_fit_full_norm <- proDA( norm_log_x,
+                                 design = ~ grp + batch,
+                                 data_is_log_transformed = TRUE,
+                                 verbose = TRUE)
+
+    saveRDS( proDA_fit_full_norm, file = file_name )
+}
+```
+
+### Test of the batch effect
+
+From the full model, we test whether the batch effect is significant. 
+First ajusted p-vals are around 0.61. We can therefore remove the batch
+covariate from the model.
+
+```{r tests_norm_full}
+batch_res <- test_diff( proDA_fit_full_norm,
+                        contrast = "batch",
+                        alternative = "two.sided",
+                        pval_adjust_method = "BH",
+                        sort_by = "pval" )
+
+head(dplyr::arrange(batch_res, adj_pval))
+```
+
+
+### Wald test of WT vs M60V
+
+Here we test (in the reduced model) whether the group difference WT vs M60V 
+is significant. We opt for a one-sided test as we know that WT group should have 
+greater intensities, M60V being the negative control. We get :
+
+- smallest p-vals around 5e-04 and adjusted p-val between 0.43 and 0.61
+
+- When looking at the p-values, we find some proteins that are significantly 
+differentially abundant, and btw they are part of FG-NUP group
+
+- however the multiple test correction provides adjusted p-values which are not
+significant at 5% level. This could probably be due to a data issue with WT 
+Replicate 1
+
+
+```{r tests_norm_partial}
+grp_res <- test_diff( proDA_fit_norm,
+                       contrast = "grpWT",
+                       alternative = "greater",
+                       pval_adjust_method = "BH",
+                       sort_by = NULL,
+                       verbose = F )
+
+dplyr::arrange(grp_res, adj_pval) %>%
+    head()
+```
+
+Let's now define the FG-NUP group : 
+
+```{r FGNUP_group_definition}
+FGNupGroup <- c("RANBP2", 
+                "NUP214", 
+                "NUPL2", 
+                "NUP62", 
+                "NUP54", 
+                "NUPL1", 
+                "NUP98", 
+                "POM121", 
+                "POM121C", 
+                "NUP153", 
+                "NUP50",
+                "POM121C;POM121B") ## added by lgatto
+kable(FGNupGroup)
+
+```
+
+We can still display a volcano plot wrt to the WT vs. M60V statistical test, 
+with no significant proteins, but where we still highlight the FG-NUP proteins.
+
+We can see that the FG-NUP proteins seems to be well represented in the highest
+fold changes.
+
+```{r display_test_results_fctions}
+plotVolcano <- function(tstResults,
+                        alpha,
+                        # set to highlight on the graph
+                        # if null => statistically signif. will be highlighted
+                        set2Highlight = NULL, 
+                        highlightColor = "red",
+                        displayHighlightedNames = FALSE
+                        ) {
+  if( !is.null(set2Highlight)){
+    highLighted <- tstResults$set == set2Highlight
+  }
+  else
+  {
+    highLighted <- tstResults$adj_pval <= alpha
+  }
+  
+  plot( x = tstResults$diff,
+      y = -log10(tstResults$adj_pval),
+      col = ifelse( highLighted, highlightColor, "grey"),
+      xlab = "lfc",
+      ylab = "-log10(pvalue)",
+      main = paste( "Diff. protein abundance (alpha =",alpha,")" )
+    )
+  
+  abline( h = -log10(alpha), col = "red", lty = 2 )
+  
+  if(displayHighlightedNames){
+    names <- as.character(tstResults$name)
+    text(tstResults$diff,
+      -log10(tstResults$adj_pval),
+      ifelse(highLighted, names, ""),
+      cex = 0.6,
+      pos = 4,
+      col = highlightColor,
+      offset = 0.5)
+  }
+}
+
+```
+
+```{r differ_abundances}
+proteins_res <- grp_res
+proteins_res$name <- fData( norm_log_x )$Gene.names
+proteins_res$set <- as.factor(ifelse(proteins_res$name %in% FGNupGroup,
+                                     "FG-NUP",
+                                     "Not_FG-NUP"))
+
+alpha <- 0.05
+
+plotVolcano(proteins_res,
+            alpha,
+            set2Highlight = "FG-NUP",
+            highlightColor = "blue",
+            displayHighlightedNames = TRUE
+            )
+
+```
+
+The below shows the histogram of p-values. These seems to be roughly uniformly 
+distributed. 
+
+```{r pValue.histogram}
+hist(proteins_res$pval, breaks = 100)
+```
+
+
+## Over Representation Analysis of the FG-NUP protein group (WT vs M60V)
+
+There is no point in using the Fisher test for Over Representation analysis
+since there is no identified statistically significant proteins when taking
+the FDR control (multiple test correction) into account.
+
+### Using GSEA
+
+We implement here a procedure
+similar to what is implemented in GSEA (for 'Gene Set Enrichment Analysis')
+software (see reference [1]).
+
+
+We first calculate the Enrichment Score as well as showing the
+Enrichment Score path.  The score is equal to 1055.3. The Enrichment
+Score path shows a steep increase for the first proteins. Note that
+each proteins belonging to FG-NUP group adds 138.7 units to the score, while
+each proteins not belonging to FG-NUP group substract only one unit to
+the score.
+
+```{r get_enrichment_score}
+# the following function calculates an enrichment score (as in
+# ref. [1] based a list of proteins with their pro-DA p-value (sorted
+# according to decreasing p-value), and their set tags.
+get_enrichment_score <- function(proteins_res, set) {
+  ## order results set
+    proteins_res <- proteins_res[ order( proteins_res$pval, decreasing = FALSE ), ]
+    n_proteins <- nrow( proteins_res )
+    n_proteins_in_set <- sum( proteins_res$set == set )
+    set_ratio <- (n_proteins - n_proteins_in_set) / n_proteins_in_set
+    set_indicators <- 1 * (proteins_res$set == set)
+    prot.contributions <- -1 * rep(1, n_proteins) + (1 + set_ratio) * set_indicators
+    path <- cumsum( prot.contributions )
+    ES <- max( path )
+    return( list( ES_path = path, ES = ES ) )
+}
+```
+
+
+```{r enrichment_score_FG-NUP_WT}
+ret <- get_enrichment_score( proteins_res, set = "FG-NUP" )
+the_ES <- ret$ES
+the_ES
+#ret$ES_path
+
+par( mfrow = c(1,1) )
+plot( x = seq( 1, length( ret$ES_path ) ),
+      y = ret$ES_path,
+      type = "l",
+      col = "blue",
+      main = "Enrichment score path" )
+```
+
+```{r GSEA_Permutation_function}
+# the following function :
+# - creates a random permutation of two sample groups (or identity permutation if 'do_permutation' == FALSE)
+# - fits the proDA analysis based on the newly assigned abundances (including NA's)
+# - calculates the p-val of the differential analysis for each gene
+# - orders the gene by decreasing order of p-val (not adjusted)
+# - calculates the Enrichment score as described in Ref. [2]
+
+# input : 'experiment' : a MSnSet object containing the experiment data
+#         'set' : the set variable (as a factor) for which to compute an enrichment score
+#         'seed' : starting seed to generate the Monte Carlo simulation from
+#         'contrast' : the contrast character to be used in the statistical test
+one_permutation_enrichment_score <- function(experiment,
+                                             set,
+                                             seed,
+                                             contrast,
+                                             filePrefix,
+                                             do_permutation = TRUE){
+  set.seed(seed)
+
+  groups <- pData(experiment)$grp
+  nSamples <- length(groups)
+  groupNames <- unique(groups)
+  nGroups <- length(groupNames)
+
+  groupSamples <- list()
+  nInGroup <- rep(0L, nGroups)
+
+  for(i in 1:nGroups){
+    groupSamples[[i]] <- which(groups == groupNames[i])
+    nInGroup[i] <- length(groupSamples[[i]])
+  }
+
+  # generate one permutation between all the groups
+  permGroupSamples <- list()
+  # keep the number of samples per group same as originally
+  if ( do_permutation ) {
+    samplesOrder <- sample(1:nSamples, nSamples, replace = FALSE)
+    currentIndex <- 0
+    for(i in 1:nGroups){
+      permGroupSamples[[i]] <- samplesOrder[currentIndex
+                                          + (1:nInGroup[i])]
+      currentIndex <- currentIndex + nInGroup[i]
+      permGroupSamples[[i]] <- sort(permGroupSamples[[i]])
+    }
+
+  } else {
+    permGroupSamples <- groupSamples
+  }
+
+  permuted_experiment <- experiment
+  for(i in 1:nGroups){
+    pData(permuted_experiment)$grp[permGroupSamples[[i]]] <- groupNames[i]
+  }
+  #pData(permuted_experiment)
+
+  # calling the proDA machinery
+
+  suffix <- paste(permGroupSamples[[1]], collapse = "_")
+  for(i in 2:nGroups){
+    suffix <- paste0(suffix, "__")
+    suffix <- paste0(suffix, paste(permGroupSamples[[i]], collapse = "_"))
+  }
+  file_name <- paste0( filePrefix, suffix, ".rds" )
+  #file_name <- paste0( "./rds/GSEA/3groups/proDA_fit_norm_perm_", suffix, ".rds" )
+
+  if (file.exists(file_name)){
+    proDA_fit_norm_perm <- readRDS(file_name)
+  } else {
+    cat(" Running proDA model fitting with permutation", suffix, "\n")
+    cat(" ***************************************************")
+    proDA_fit_norm_perm <- proDA(permuted_experiment,
+                                 design = ~ grp,
+                                 data_is_log_transformed = TRUE,
+                                 verbose = TRUE)
+
+    saveRDS(proDA_fit_norm_perm, file = file_name)
+  }
+
+  # getting the proDA results
+  perm_res <- test_diff( proDA_fit_norm_perm,
+                       contrast = contrast,
+                       alternative = "greater",
+                       pval_adjust_method = "BH",
+                       sort_by = NULL,
+                       verbose = FALSE)
+  perm_res$name <- fData(experiment)$Gene.names
+  perm_res$set <- set
+  ret <- get_enrichment_score(perm_res, set = levels(set)[1])
+  ret
+}
+```
+
+The permutation test shows that among all possible sample permutations - 20
+different permutations - , the actual data have the highest enrichment score
+for the FG-Nup group.
+
+```{R GSEA_Permutation_test_WT}
+file_name <- "./rds/GSEA/2groups/permutation_test.rds"
+filePrefix <- "./rds/GSEA/2groups/proDA_fit_norm_perm_"
+mySeed <- 20190512
+
+if ( file.exists( file_name )) {
+  ER_sample <- readRDS( file_name )
+} else {
+  n_permutations <- 100
+  ER_sample <- rep(0, n_permutations)
+  for (i in 1:n_permutations) {
+      seed <- mySeed + i
+      ret <- one_permutation_enrichment_score(norm_log_x,
+                                              set = proteins_res$set,
+                                              seed = seed,
+                                              contrast = "grpWT",
+                                              filePrefix = filePrefix,
+                                              do_permutation = TRUE)
+      ER_sample[i] <- ret$ES
+  }
+
+  saveRDS( ER_sample, file_name )
+}
+
+#hist( ER_sample, main = "Enrichment Score p-value")
+
+#max( ER_sample )
+ERS <- sort( unique( ER_sample ) )
+## hist( ERS, main = "Enrichment Scores - permutation values")
+plot( density(ERS), main = "Enrichment Scores - permutation values")
+rug(ERS)
+abline( v = the_ES, col = "blue" )
+```
+
+
+## Export final results
+
+Full export: normalised data and proDA results (for shiny app)
+
+```{r full_export}
+fd <- fData(norm_log_x)[, c("Protein.IDs",
+                            "Protein.names",
+                            "Gene.names",
+                            "nNA")]
+norm_log_x1 <- norm_log_x
+fd1 <- dplyr::full_join(fd, proteins_res, by = c("Gene.names" = "name"))
+fd1 <- fd1[!duplicated(fd1[[1]]),]
+rownames(fd1) <- fd1[[1]]
+fData(norm_log_x1) <- fd1
+res1 <- ms2df(norm_log_x1)
+res1$set[res1$set == "Not_FG-NUP"] <- NA
+saveRDS(res1, file = "rds/res_expR_WT_vs_M60V.rds")
+```
+
+## Session information
+
+```{r si}
+sessionInfo()
+```
+
+## References
+
+[1] Subramanian, Aravind, Pablo Tamayo, Vamsi K. Mootha, Sayan Mukherjee, 
+Benjamin L. Ebert, Michael A. Gillette, Amanda Paulovich, et al. 2005. 
+"Gene Set Enrichment Analysis: A Knowledge-Based Approach for Interpreting 
+Genome-Wide Expression Profiles." Proceedings of the National Academy of 
+Sciences of the United States of America 102 (43): 15545-50.
