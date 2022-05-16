@@ -3,7 +3,8 @@ This repo contains datasets and R scripts that were used to obtain the results d
 LIZCANO-PERRET, B. & MICHIELS, T. 2022. : Cardioviruses' leader proteins retarget RSK kinases toward alternative substrates to perturb nucleocytoplasmic traffic.
 
 - Rmd scripts are stored in the main directory, together with html outputs. 
-- Dumps of intermediary R objects are stored in /rds directory.
+- Dumps of intermediary R objects are stored in /rds directory. This allows to keep intermediary results in order to speed up the run of the script. 
+However, if one would like to re-launch (parts of) the computations from scratch, one just need to delete (or rename) the corresponding .rds objects, and re-launch the .rmd scripts.
 - Datasets are stored in /data directory. Additional information needed to interpret the datasets is provided herebelow.
 
 MASSPROT experiment numbers:
@@ -35,3 +36,7 @@ MASSPROT experiment numbers:
 
 - L-Experiment: MaxQuant analysis: 20191129 on windows computer: L: WT + M60V + F48A
 - R-Experiment : MaxQuant analysis: 20191218 on windows computer : R : WT + M60V
+
+### Comment on reproducibility of results
+Re-run from scratch of the computations with more recent versions of proDA might lead to slightly different outcomes (e.g. an impact on 4th digit - or further - on p-values has been seen), 
+but should not change the conclusions of the analysis, i.e. order of differentially abundant proteins and shape of volcano plots.
