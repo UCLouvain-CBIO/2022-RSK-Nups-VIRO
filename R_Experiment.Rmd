@@ -495,8 +495,8 @@ different permutations - , the actual data have the highest enrichment score
 for the FG-Nup group.
 
 ```{R GSEA_Permutation_test_WT}
-file_name <- "./rds/GSEA/2groups/permutation_test.rds"
-filePrefix <- "./rds/GSEA/2groups/proDA_fit_norm_perm_"
+file_name <- "./rds/GSEA/2groupsR/permutation_test_enrichscores_WT_vs_M60V.rds"
+filePrefix <- "./rds/GSEA/2groupsR/proDA_fit_norm_perm_"
 mySeed <- 20190512
 
 if ( file.exists( file_name )) {
