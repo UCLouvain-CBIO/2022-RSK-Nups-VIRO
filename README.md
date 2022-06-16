@@ -4,8 +4,6 @@ This repo contains datasets and R scripts that were used to obtain the results d
 > *Cardiovirus leader proteins retarget RSK kinases toward alternative substrates to perturb nucleocytoplasmic traffic* Belén Lizcano-Perret; Cécile Lardinois; Fanny Wavreil; Philippe Hauchamps; Gaëtan Herinckx; Frédéric Sorgeloos; Didier Vertommen; Laurent Gatto; Thomas Michiels
 
 
-traffic.
-
 - Rmd scripts are stored in the main directory, together with html outputs. 
 - Dumps of intermediary R objects are stored in /rds directory. This allows to keep intermediary results in order to speed up the run of the script. 
 However, if one would like to re-launch (parts of) the computations from scratch, one just need to delete (or rename) the corresponding .rds objects, and re-launch the .rmd scripts.
