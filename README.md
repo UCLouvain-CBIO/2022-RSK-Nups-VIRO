@@ -1,7 +1,7 @@
-# 2022-RSK-Nups-VIRO
-This repo contains datasets and R scripts that were used to obtain the results described in the following submitted article :
+This repo contains datasets and R scripts that were used to obtain the results described in the following study :
 
-> *Cardiovirus leader proteins retarget RSK kinases toward alternative substrates to perturb nucleocytoplasmic traffic* Belén Lizcano-Perret; Cécile Lardinois; Fanny Wavreil; Philippe Hauchamps; Gaëtan Herinckx; Frédéric Sorgeloos; Didier Vertommen; Laurent Gatto; Thomas Michiels
+> Cardiovirus leader proteins retarget RSK kinases toward alternative substrates to perturb nucleocytoplasmic traffic
+Belen Lizcano-Perret, Cecile Lardinois, Fanny Wavreil, Philippe Hauchamps, Gaetan Herinckx, Frederic Sorgeloos, Didier Vertommen, Laurent Gatto, Thomas Michiels bioRxiv 2022.06.16.496404; doi:[10.1101/2022.06.16.496404](https://doi.org/10.1101/2022.06.16.496404)
 
 
 - Rmd scripts are stored in the main directory, together with html outputs. 
